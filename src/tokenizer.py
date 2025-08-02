@@ -347,10 +347,7 @@ class WrappedOurPretrainedTokenizer():
         return self.model.quantizer.codebook.weight.shape[0] + 5
     
     def get_codebook_embedding(self,):
-        if self.ckpt_name == "AminoAseed":
-            return self.model.quantizer.linear_proj(self.model.quantizer.codebook.weight)
-        else:
-            return self.model.quantizer.codebook.weight
+        return self.model.quantizer.codebook.weight
     
     def encode_structure(self, pdb_chain, use_continuous=False, use_sequence=False):
         assert use_sequence

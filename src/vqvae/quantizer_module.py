@@ -50,10 +50,7 @@ class BaseQuantizer(nn.Module):
     
     @torch.no_grad()
     def get_codebook(self,):
-        if self.use_linear_project:
-            self.linear_proj(self.codebook.weight)
-        else:
-            return self.codebook.weight
+        return self.codebook.weight
 
     def indices2embedding(self, indices: torch.IntTensor) -> torch.Tensor:
         z_q = self.codebook[indices]
