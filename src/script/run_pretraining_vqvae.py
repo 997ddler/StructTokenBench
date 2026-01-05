@@ -41,6 +41,10 @@ def setup_trainer(cfg):
         hydra.utils.instantiate(cfg.lightning.callbacks.lr_monitor),
         hydra.utils.instantiate(cfg.lightning.callbacks.progress_bar),
     ]
+    
+    # Add periodic checkpoint callback if it exists
+    if hasattr(cfg.lightning.callbacks, 'periodic_checkpoint'):
+        callbacks.append(hydra.utils.instantiate(cfg.lightning.callbacks.periodic_checkpoint))
     trainer = pl.Trainer(
         **cfg.trainer,
         callbacks=callbacks,

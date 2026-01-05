@@ -4,6 +4,10 @@ from glob import glob
 import hydra
 import omegaconf
 
+os.environ["http_proxy"] = "http://127.0.0.1:1087"
+os.environ["https_proxy"] = "http://127.0.0.1:1087"
+
+
 import pytorch_lightning as pl
 import torch
 from torch.utils.tensorboard import SummaryWriter

@@ -8,6 +8,7 @@ defaults:
 model:
     class_name: "VQVAEModel"
     pretrained_ckpt_path: "" # where to load the pretrained pLM
+    ae_backbone_ckpt_path: "" # where to load the pretrained AE backbone (encoder + decoder)
     ckpt_path: null
     quantizer:
         quantizer_type: StraightThroughQuantizer
@@ -25,12 +26,13 @@ model:
         n_heads: 1
         v_heads: 128
         n_layers: 2
-        d_out: 128
+        d_out: 1024 # original 128
     decoder:
         d_model: 1024
         n_heads: 16
         n_layers: 8
 deepspeed_path: src/script/config/deepspeed/32_stage2.json
+
 default_data_dir: null
 tokenizer: null
 max_steps: 10000

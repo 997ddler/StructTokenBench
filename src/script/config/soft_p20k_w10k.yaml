@@ -1,0 +1,76 @@
+defaults:
+    - _self_
+    - trainer: base
+    - lightning: pretrain
+    - data: pretrain_pdb
+    - optimization: base
+    - autorestart: base
+model:
+    class_name: "VQVAEModel"
+    pretrained_ckpt_path: "" # where to load the pretrained pLM
+    ae_backbone_ckpt_path: "/data3/zwh/pstbench/struct_token_bench_logs/vqvae-pretrain-subsample10_AE_fastdevfalse/version_0/checkpoints/epoch=64-step=20540-validation_f1_score=0.00.ckpt/checkpoint/mp_rank_00_model_states.pt" # where to load the pretrained AE backbone (encoder + decoder)
+    ckpt_path: null
+    quantizer:
+        quantizer_type: StraightThroughQuantizer
+        loss_weight:
+            commitment_loss_weight: 0.25
+            quantization_loss_weight: 1.0
+            reconstruction_loss_weight: 1.0
+        codebook_size: 512
+        codebook_embed_size: 1024
+        _need_init: true
+        freeze_codebook: false
+        use_linear_project: false
+        soft_ae_training: true
+        soft_ae_iters: 10000
+        soft_ae_scheduler: cosine
+        lambda_loss: 0.0
+        soft_loss: false
+        use_soft_representation: true
+        use_kmeans_init: true
+    encoder:
+        d_model: 1024
+        n_heads: 1
+        v_heads: 128
+        n_layers: 2
+        d_out: 1024 # original 128
+    decoder:
+        d_model: 1024
+        n_heads: 16
+        n_layers: 8
+deepspeed_path: src/script/config/deepspeed/32_stage2.json
+
+default_data_dir: null
+tokenizer: null
+max_steps: 10000
+experiment_name: soft_p20k_w10k # used for tensorboard
+run_name: soft_p20k_w10k_run
+validate_only: false
+test_only: false
+
+save_dir_path: "" # would be indicated during running
+tokenizer_device: "cuda" # or "cpu": where to put the tokenizer.tokenizer_encoder. 
+
+lightning:
+    callbacks:
+        checkpoint:
+            _target_: pytorch_lightning.callbacks.ModelCheckpoint
+            every_n_train_steps: null
+            every_n_epochs: 10  # Keep saving every epoch for "last"
+            save_top_k: 1  # Or keep your current value
+            monitor: "validation_bb_rmsd"  # Adjust based on your metrics
+            mode: "min"
+            filename: "last-{epoch}-{step}"
+            save_last: True  # This saves the last checkpoint
+            dirpath: null
+        
+        # Add a new periodic checkpoint callback
+        periodic_checkpoint:
+            _target_: pytorch_lightning.callbacks.ModelCheckpoint
+            every_n_train_steps: 10000
+            every_n_epochs: null  # Save every 10 epochs
+            save_top_k: -1  # Keep all periodic checkpoints
+            monitor: null  # Don't monitor, just save periodically
+            filename: "soft_p20k_w10k_checkpoint-{step:06d}"
+            save_last: False
+            dirpath: null

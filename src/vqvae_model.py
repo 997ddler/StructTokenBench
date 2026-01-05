@@ -493,13 +493,29 @@ class VQVAEModel(nn.Module):
         super().__init__()
 
         self.model_cfg = model_cfg
-        quantizer_cfg = model_cfg.quantizer
-        self.loss_weight = quantizer_cfg["loss_weight"]
-        self.quantizer = eval(quantizer_cfg["quantizer_type"])(**quantizer_cfg)
+        
+        # Make quantizer optional - if None, acts as regular AE
+        if hasattr(model_cfg, 'quantizer') and model_cfg.quantizer is not None:
+            quantizer_cfg = model_cfg.quantizer
+            self.loss_weight = quantizer_cfg["loss_weight"]
+            self.quantizer = eval(quantizer_cfg["quantizer_type"])(**quantizer_cfg)
+            self.use_quantization = True
+            n_codes = quantizer_cfg.codebook_size
+        else:
+            # AE mode: no quantizer
+            self.quantizer = None
+            self.use_quantization = False
+            # Default loss weights for AE
+            if hasattr(model_cfg, 'loss_weight'):
+                self.loss_weight = model_cfg.loss_weight
+            else:
+                self.loss_weight = {"reconstruction_loss_weight": 1.0}
+            # Use a default n_codes for encoder (not used in AE but needed for init)
+            n_codes = getattr(model_cfg, 'n_codes', 512)
 
         self.encoder = VanillaStructureTokenEncoder(
             **model_cfg.encoder,
-            n_codes=quantizer_cfg.codebook_size
+            n_codes=n_codes
         ) # encoder_d_out not necessarily the same as self.codebook_embed_size
         model_cfg.decoder["encoder_d_out"] = model_cfg.encoder.d_out
         self.decoder = VanillaStructureTokenDecoder(**model_cfg.decoder)
@@ -509,10 +525,7 @@ class VQVAEModel(nn.Module):
             output_dim=len(C.SEQUENCE_VOCAB)
         )
 
-        self._step_count = 0
-
-    def forward(self, input_list, use_as_tokenizer=False):
-        self._step_count += 1
+    def forward(self, input_list, use_as_tokenizer=False, global_step=None):
 
         coords, attention_mask, residue_index, seq_residue_tokens, pdb_chain = input_list
         sequence_id = None
@@ -534,11 +547,28 @@ class VQVAEModel(nn.Module):
         # sequence_id: torch.Tensor | None = None,
         # residue_index: torch.Tensor | None = None,
         z = self.encoder.encode(coords, attention_mask, sequence_id, residue_index)
-        assert self.quantizer.codebook_embed_size == self.encoder.d_out
-        quantized_z, quantized_indices, partial_loss, partial_metrics = self.quantizer(z)
-        assert not z.isnan().any() and not quantized_indices.isnan().any()
+        
+        # Apply quantization if quantizer exists, otherwise use continuous latents
+        if self.use_quantization:
+            assert self.quantizer.codebook_embed_size == self.encoder.d_out, f"{self.quantizer.codebook_embed_size} != {self.encoder.d_out}"
+            # Pass global_step for soft warmup scheduling (only during training)
+            cur_iter = global_step if self.training and global_step is not None else None
+            quantized_z, quantized_indices, partial_loss, partial_metrics = self.quantizer(z, cur_iter=cur_iter)
+            assert not z.isnan().any() and not quantized_indices.isnan().any()
+        else:
+            # AE mode: use continuous latent representation directly
+            quantized_z = z  # Continuous latent, no quantization
+            quantized_indices = torch.zeros(
+                z.shape[0], z.shape[1], 
+                dtype=torch.int64, 
+                device=z.device
+            )  # Dummy indices for decoder compatibility
+            partial_loss = torch.tensor(0.0, device=z.device, requires_grad=False)
+            partial_metrics = {}  # No quantization metrics
+        
         if use_as_tokenizer:
             return quantized_z, quantized_indices, z
+        
         decoded_states = self.decoder.decode(quantized_z, quantized_indices, attention_mask, sequence_id)
 
         # reconstructed proteins
@@ -794,6 +824,42 @@ class LightningVQPretrainModel(pl.LightningModule):
         for split in self.all_split_names:
             setattr(self, f"{split}_step_outputs", [])
 
+    def _load_ae_backbone(self, ckpt_path: str):
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"AE backbone checkpoint not found: {ckpt_path}")
+        
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if rank == 0:
+            self.py_logger.info(f"Loading AE backbone from {ckpt_path}")
+        
+        # Load checkpoint
+        state_dict = torch.load(ckpt_path, map_location="cpu")
+        
+        # --------------- Check deepspeed format -----------------
+        if 'module' in state_dict:
+            if rank == 0: self.py_logger.info("DeepSpeed format detected, extracting 'module'...")
+            state_dict = state_dict['module']
+            
+        elif 'state_dict' in state_dict:
+            state_dict = state_dict['state_dict']
+
+        loaded_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith('model.'):
+                new_k = k[len('model.'):]
+                loaded_state_dict[new_k] = v
+            else:
+                loaded_state_dict[k] = v
+        
+        missing_keys, unexpected_keys = self.model.load_state_dict(loaded_state_dict, strict=False)
+        
+        if rank == 0:
+            self.py_logger.info(f"Loaded {len(loaded_state_dict)} parameters from AE backbone")
+            if missing_keys:
+                self.py_logger.warning(f"Missing keys: {missing_keys[:]}...")
+            if unexpected_keys:
+                self.py_logger.warning(f"Unexpected keys: {unexpected_keys[:5]}...")
+
     def setup(self, stage: str):
         """
         Set up the module, including model creation
@@ -801,16 +867,26 @@ class LightningVQPretrainModel(pl.LightningModule):
             stage: PTL stage train/val/test can be used to induce different
                     behavior only used for inheritance
         """
-
-        self.trainer.strategy.config["train_micro_batch_size_per_gpu"] = self.optimizer_cfg.micro_batch_size
+        
+        if hasattr(self.trainer.strategy, "config"):
+            self.trainer.strategy.config["train_micro_batch_size_per_gpu"] = self.optimizer_cfg.micro_batch_size
+        else:
+            print(self.trainer.strategy)
         self.model = model_init_fn(self.trainer, self.model_cfg)
+
+        # Load AE backbone weights if specified
+        
+        self.py_logger.info(f"Loading AE backbone from {self.model_cfg.ae_backbone_ckpt_path}\n\n\n\n\n\n")
+        if hasattr(self.model_cfg, 'ae_backbone_ckpt_path') and self.model_cfg.ae_backbone_ckpt_path:
+            self._load_ae_backbone(self.model_cfg.ae_backbone_ckpt_path)
 
         # get time here for first iteration at batch 0
         # logged in on_train_batch_end
         self._last_logged_batch_start_time = time.monotonic()
 
     def training_step(self, batch, batch_idx):
-        outputs = self.model(batch["input_list"])
+        # Pass global_step for warmup scheduling
+        outputs = self.model(batch["input_list"], global_step=self.global_step)
         loss, metrics = outputs[0]
 
         self.log(
@@ -847,7 +923,8 @@ class LightningVQPretrainModel(pl.LightningModule):
         torch.cuda.empty_cache()
 
     def _valid_or_test_step(self, batch, batch_idx, split="validation"):
-        outputs = self.model(batch["input_list"])
+        # Don't pass global_step during validation/testing (warmup only applies to training)
+        outputs = self.model(batch["input_list"], global_step=None)
         loss, metrics = outputs[0]
 
         log_metrics = {
